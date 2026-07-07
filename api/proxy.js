@@ -21,6 +21,15 @@
  *      替换成目标域名，让目标站点认为请求是从它自己的域名发出的。
  *   3. 拿到目标站点的响应后，把 Location / Set-Cookie 等涉及域名的响应头
  *      改写回代理路径，其余原样透传给浏览器。
+ *
+ * 关于 /cdn-cgi/rum：
+ * /cdn-cgi/ 是 Cloudflare 在每个接入 Cloudflare 的域名上保留的特殊端点，
+ * 完全由 Cloudflare 边缘节点自己处理，不会转发到源站（如 Facebook 后端）。
+ * 其中 /cdn-cgi/rum 是 Cloudflare Web Analytics（真实用户性能监控）的数据
+ * 上报地址，正常应返回 204。由于代理请求是服务器到服务器发起的（而非真实
+ * 用户浏览器直连），Cloudflare 会在边缘层判定来源不合法而返回 404——这类
+ * 请求只是页面性能打点，跟业务功能无关，因此直接在代理层短路拦截，
+ * 统一返回 204，避免转发一次注定失败的请求、污染日志和 Network 面板。
  */
 
 export const config = {
@@ -44,6 +53,11 @@ const SKIP_REQUEST_HEADERS = new Set([
 // 透传响应时需要跳过的响应头（长度/编码由运行时重新计算，避免冲突）
 const SKIP_RESPONSE_HEADERS = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection']);
 
+// Cloudflare 的 /cdn-cgi/ 保留端点中，纯统计上报类的路径由边缘节点自己处理，
+// 代理转发过去必定失败（服务器到服务器请求会被 Cloudflare 判定来源不合法），
+// 直接在代理层短路拦截、原样返回 204，不发起真实转发。
+const CDN_CGI_NOOP_PATH_REG = /^\/cdn-cgi\/(rum|beacon)(\/|$)/i;
+
 export default async function handler(request) {
   const url = new URL(request.url);
   const params = url.searchParams;
@@ -54,6 +68,11 @@ export default async function handler(request) {
 
   if (!protocol || !domain) {
     return new Response('Bad proxy request: missing target', { status: 400 });
+  }
+
+  // /cdn-cgi/rum 等 Cloudflare 边缘自处理的性能打点端点，直接短路返回 204
+  if (CDN_CGI_NOOP_PATH_REG.test(restPath)) {
+    return new Response(null, { status: 204 });
   }
 
   // 还原出真正发给目标站点的 query，需要去掉两类内部参数：
